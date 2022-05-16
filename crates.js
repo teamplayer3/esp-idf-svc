@@ -1,0 +1,1 @@
+window.ALL_CRATES = ["anyhow","base64","cfg_if","cstr_core","cty","embedded_hal","embedded_svc","enumset","esp_idf_hal","esp_idf_svc","esp_idf_sys","http_auth_basic","itoa","log","memchr","nb","no_std_net","num_enum","ryu","serde","serde_json","strum"];

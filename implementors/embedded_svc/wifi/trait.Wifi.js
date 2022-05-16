@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["esp_idf_svc"] = [{"text":"impl <a class=\"trait\" href=\"embedded_svc/wifi/trait.Wifi.html\" title=\"trait embedded_svc::wifi::Wifi\">Wifi</a> for <a class=\"struct\" href=\"esp_idf_svc/wifi/struct.EspWifi.html\" title=\"struct esp_idf_svc::wifi::EspWifi\">EspWifi</a>","synthetic":false,"types":["esp_idf_svc::wifi::EspWifi"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

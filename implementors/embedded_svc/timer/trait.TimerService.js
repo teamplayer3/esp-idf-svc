@@ -1,0 +1,4 @@
+(function() {var implementors = {};
+implementors["embedded_svc"] = [];
+implementors["esp_idf_svc"] = [{"text":"impl&lt;T&gt; <a class=\"trait\" href=\"embedded_svc/timer/trait.TimerService.html\" title=\"trait embedded_svc::timer::TimerService\">TimerService</a> for <a class=\"struct\" href=\"esp_idf_svc/timer/struct.EspTimerService.html\" title=\"struct esp_idf_svc::timer::EspTimerService\">EspTimerService</a>&lt;T&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;T: <a class=\"trait\" href=\"esp_idf_svc/timer/trait.EspTimerServiceType.html\" title=\"trait esp_idf_svc::timer::EspTimerServiceType\">EspTimerServiceType</a>,&nbsp;</span>","synthetic":false,"types":["esp_idf_svc::timer::EspTimerService"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

@@ -1,0 +1,4 @@
+(function() {var implementors = {};
+implementors["embedded_svc"] = [];
+implementors["esp_idf_svc"] = [{"text":"impl <a class=\"trait\" href=\"embedded_svc/storage/trait.Storage.html\" title=\"trait embedded_svc::storage::Storage\">Storage</a> for <a class=\"struct\" href=\"esp_idf_svc/nvs_storage/struct.EspNvsStorage.html\" title=\"struct esp_idf_svc::nvs_storage::EspNvsStorage\">EspNvsStorage</a>","synthetic":false,"types":["esp_idf_svc::nvs_storage::EspNvsStorage"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

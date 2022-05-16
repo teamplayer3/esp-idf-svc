@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["esp_idf_svc"] = [{"text":"impl <a class=\"trait\" href=\"embedded_svc/timer/trait.PeriodicTimer.html\" title=\"trait embedded_svc::timer::PeriodicTimer\">PeriodicTimer</a> for <a class=\"struct\" href=\"esp_idf_svc/timer/struct.EspTimer.html\" title=\"struct esp_idf_svc::timer::EspTimer\">EspTimer</a>","synthetic":false,"types":["esp_idf_svc::timer::EspTimer"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

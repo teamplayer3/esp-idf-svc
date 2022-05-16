@@ -1,0 +1,4 @@
+(function() {var implementors = {};
+implementors["base64"] = [{"text":"impl&lt;'a, W:&nbsp;Write&gt; Write for <a class=\"struct\" href=\"base64/write/struct.EncoderWriter.html\" title=\"struct base64::write::EncoderWriter\">EncoderWriter</a>&lt;'a, W&gt;","synthetic":false,"types":["base64::write::encoder::EncoderWriter"]}];
+implementors["embedded_svc"] = [{"text":"impl&lt;W&gt; Write for <a class=\"struct\" href=\"embedded_svc/io/struct.StdWrite.html\" title=\"struct embedded_svc::io::StdWrite\">StdWrite</a>&lt;W&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;W: <a class=\"trait\" href=\"embedded_svc/io/trait.Write.html\" title=\"trait embedded_svc::io::Write\">Write</a>,&nbsp;</span>","synthetic":false,"types":["embedded_svc::io::stdio::StdWrite"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

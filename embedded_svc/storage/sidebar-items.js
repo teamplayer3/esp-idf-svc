@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["MemoryStorage",""],["StorageCache",""]],"trait":[["Storage",""]]});

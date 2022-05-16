@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["esp_idf_svc"] = [{"text":"impl&lt;T&gt; <a class=\"trait\" href=\"embedded_svc/event_bus/trait.Spin.html\" title=\"trait embedded_svc::event_bus::Spin\">Spin</a> for <a class=\"struct\" href=\"esp_idf_svc/eventloop/struct.EspEventLoop.html\" title=\"struct esp_idf_svc::eventloop::EspEventLoop\">EspEventLoop</a>&lt;<a class=\"struct\" href=\"esp_idf_svc/eventloop/struct.User.html\" title=\"struct esp_idf_svc::eventloop::User\">User</a>&lt;T&gt;&gt;","synthetic":false,"types":["esp_idf_svc::eventloop::EspEventLoop"]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

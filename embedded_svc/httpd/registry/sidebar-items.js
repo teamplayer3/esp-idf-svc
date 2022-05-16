@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["MiddlewareRegistry",""],["RegistryBuilder",""]],"trait":[["Registry",""]]});
