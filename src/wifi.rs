@@ -1564,7 +1564,7 @@ pub mod asyncify {
         wifi::Status,
     };
 
-    use esp_idf_hal::mutex::Condvar;
+    use esp_idf_hal::mutex::{Condvar, Mutex};
 
     use crate::private::waitable::Waitable;
 
@@ -1608,14 +1608,14 @@ pub mod asyncify {
     #[derive(Clone)]
     pub(super) struct StatusChangeFuture {
         shared: Arc<Waitable<super::Shared>>,
-        last_status: Rc<RefCell<Status>>,
+        last_status: Arc<Mutex<Status>>,
     }
 
     impl StatusChangeFuture {
         pub fn new(shared: Arc<Waitable<super::Shared>>) -> Self {
             let curr_status = { shared.state.lock().status.to_owned() };
             Self {
-                last_status: Rc::new(RefCell::new(curr_status)),
+                last_status: Arc::new(Mutex::new(curr_status)),
                 shared,
             }
         }
@@ -1629,8 +1629,8 @@ pub mod asyncify {
             cx: &mut core::task::Context<'_>,
         ) -> Poll<Self::Output> {
             let new_status = { self.shared.state.lock().status.to_owned() };
-            if !self.last_status.borrow().eq(&new_status) {
-                let _ = self.last_status.replace(new_status.to_owned());
+            if !self.last_status.lock().eq(&new_status) {
+                *self.last_status.lock() = new_status.to_owned();
                 return Poll::Ready(new_status);
             }
 
