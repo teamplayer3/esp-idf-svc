@@ -1124,22 +1124,22 @@ impl EspWifi {
         let on_scan_finished =
             EventOccureFuture::new(self.waitable.to_owned(), Some(WifiEvent::ScanDone));
 
-        let scan_config = scan_config.map(wifi_scan_config_t::from);
-        esp!(unsafe {
-            esp_wifi_scan_start(
-                scan_config
-                    .as_ref()
-                    .map_or(ptr::null(), |s| s as *const wifi_scan_config_t),
-                false,
-            )
-        })?;
+        {
+            let scan_config = scan_config.map(wifi_scan_config_t::from);
+            esp!(unsafe {
+                esp_wifi_scan_start(
+                    scan_config
+                        .as_ref()
+                        .map_or(ptr::null(), |s| s as *const wifi_scan_config_t),
+                    false,
+                )
+            })?;
+        }
         let _ = on_scan_finished.await;
 
         let mut found_ap: u16 = 0;
         esp!(unsafe { esp_wifi_scan_get_ap_num(&mut found_ap as *mut _) })?;
-
         info!("Found {} access points", found_ap);
-
         Ok(usize::from(found_ap))
     }
 
