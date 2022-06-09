@@ -1,5 +1,6 @@
 use core::cell::UnsafeCell;
 use core::cmp;
+use core::future::Future;
 use core::ptr;
 use core::time::Duration;
 
@@ -27,10 +28,79 @@ use crate::nvs::EspDefaultNvs;
 use crate::private::common::*;
 use crate::private::cstr::*;
 use crate::private::waitable::*;
+use crate::private::waker_registry::WakerRegistry;
 use crate::sysloop::*;
 
 #[cfg(feature = "experimental")]
-pub use asyncify::*;
+use asyncify::*;
+
+/// more info: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi.html?highlight=wifi%20scan#esp32-wi-fi-scan
+#[derive(Debug)]
+#[repr(u32)]
+pub enum ScanType {
+    Active = 0,
+    Passive = 1,
+}
+
+impl From<ScanType> for u32 {
+    fn from(s: ScanType) -> Self {
+        match s {
+            ScanType::Active => 0,
+            ScanType::Passive => 1,
+        }
+    }
+}
+
+impl Default for ScanType {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+/// more info: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi.html?highlight=wifi%20scan#esp32-wi-fi-scan
+#[derive(Debug)]
+pub struct ScanTime {
+    pub active: (u32, u32),
+    pub passive: u32,
+}
+
+impl Default for ScanTime {
+    fn default() -> Self {
+        Self {
+            active: (0, 0),
+            passive: 0,
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct ScanConfig {
+    pub bssid: Option<[u8; 8]>,
+    pub ssid: Option<String>,
+    pub channel: Option<u8>,
+    pub scan_type: ScanType,
+    pub scan_time: ScanTime,
+    pub show_hidden: bool,
+}
+
+impl From<ScanConfig> for wifi_scan_config_t {
+    fn from(s: ScanConfig) -> Self {
+        Self {
+            bssid: s.bssid.map_or(ptr::null(), |v| v.as_ptr()) as *mut u8,
+            ssid: s.ssid.map_or(ptr::null(), |v| v.as_ptr()) as *mut u8,
+            scan_time: wifi_scan_time_t {
+                active: wifi_active_scan_time_t {
+                    min: s.scan_time.active.0,
+                    max: s.scan_time.active.1,
+                },
+                passive: s.scan_time.passive,
+            },
+            channel: s.channel.unwrap_or_default(),
+            scan_type: s.scan_type.into(),
+            show_hidden: s.show_hidden,
+        }
+    }
+}
 
 const MAX_AP: usize = 20;
 
@@ -200,6 +270,11 @@ struct Shared {
 
     sta_netif: Option<EspNetif>,
     ap_netif: Option<EspNetif>,
+
+    #[cfg(feature = "experimental")]
+    status_change_wakers: WakerRegistry,
+    #[cfg(feature = "experimental")]
+    last_wifi_event: Option<WifiEvent>,
 }
 
 impl Shared {
@@ -225,6 +300,11 @@ impl Default for Shared {
             operating: false,
             sta_netif: None,
             ap_netif: None,
+
+            #[cfg(feature = "experimental")]
+            status_change_wakers: WakerRegistry::new(),
+            #[cfg(feature = "experimental")]
+            last_wifi_event: None,
         }
     }
 }
@@ -712,7 +792,7 @@ impl EspWifi {
             _ => (None, None),
         };
 
-        if client_status.is_some() || ap_status.is_some() {
+        let ret = if client_status.is_some() || ap_status.is_some() {
             if let Some(client_status) = client_status {
                 shared.status.0 = client_status;
             }
@@ -731,7 +811,15 @@ impl EspWifi {
             info!("STA event {:?} skipped", event);
 
             Ok(false)
+        };
+
+        #[cfg(feature = "experimental")]
+        {
+            let _ = shared.last_wifi_event.insert(event.to_owned());
+            shared.status_change_wakers.awake_all();
         }
+
+        ret
     }
 
     fn on_ip_event(shared: &mut Shared, event: &IpEvent) -> Result<bool, EspError> {
@@ -787,6 +875,355 @@ impl EspWifi {
         } else {
             ClientStatus::Started(ClientConnectionStatus::Disconnected)
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+enum Mode {
+    None,
+    SoftAp,
+    Client,
+    ApClient,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransitionState {
+    None,
+    Full,
+    Half,
+}
+
+impl Mode {
+    pub fn starting_status(&self) -> Status {
+        match self {
+            Self::None => Status(ClientStatus::Stopped, ApStatus::Stopped),
+            Self::SoftAp => Status(ClientStatus::Stopped, ApStatus::Starting),
+            Self::Client => Status(ClientStatus::Starting, ApStatus::Stopped),
+            Self::ApClient => Status(ClientStatus::Starting, ApStatus::Starting),
+        }
+    }
+
+    pub fn has_status_successfully_transitioned(&self, status: &Status) -> TransitionState {
+        match self {
+            Self::None => {
+                if let Status(ClientStatus::Stopped, ApStatus::Stopped) = status {
+                    return TransitionState::Full;
+                }
+            }
+            Self::SoftAp => {
+                if let Status(ClientStatus::Stopped, ApStatus::Started(_)) = status {
+                    return TransitionState::Full;
+                }
+            }
+            Self::Client => {
+                if let Status(ClientStatus::Started(_), ApStatus::Stopped) = status {
+                    return TransitionState::Full;
+                }
+            }
+            Self::ApClient => match status {
+                Status(ClientStatus::Started(_), ApStatus::Started(_)) => {
+                    return TransitionState::Full
+                }
+                Status(ClientStatus::Started(_), _) => return TransitionState::Half,
+                Status(_, ApStatus::Started(_)) => return TransitionState::Half,
+                _ => (),
+            },
+        }
+
+        TransitionState::None
+    }
+}
+
+impl From<Configuration> for Mode {
+    fn from(c: Configuration) -> Self {
+        match c {
+            Configuration::None => Mode::None,
+            Configuration::AccessPoint(_) => Mode::SoftAp,
+            Configuration::Client(_) => Mode::Client,
+            Configuration::Mixed(_, _) => Mode::ApClient,
+        }
+    }
+}
+
+#[cfg(feature = "experimental")]
+impl EspWifi {
+    pub fn wait_for_wifi_event(&mut self, event: WifiEvent) -> impl Future<Output = WifiEvent> {
+        EventOccureFuture::new(self.waitable.to_owned(), Some(event))
+    }
+
+    /// Scans for available accesspoints.
+    ///
+    /// To call this function, the wifi must be configured in accesspoint mode or at least in mixed mode.
+    pub async fn async_scan(
+        &mut self,
+        scan_config: Option<ScanConfig>,
+    ) -> Result<vec::Vec<AccessPointInfo>, EspError> {
+        let total_count = self.async_do_scan(scan_config).await?;
+
+        let mut ap_infos_raw: vec::Vec<wifi_ap_record_t> =
+            vec::Vec::with_capacity(total_count as usize);
+        #[allow(clippy::uninit_vec)]
+        // ... because we are filling it in on the next line and only reading the initialized members
+        unsafe {
+            ap_infos_raw.set_len(total_count as usize)
+        };
+
+        let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
+
+        let mut result = vec::Vec::with_capacity(real_count);
+        for ap_info_raw in ap_infos_raw.iter().take(real_count) {
+            let ap_info: AccessPointInfo = Newtype(ap_info_raw).into();
+
+            result.push(ap_info);
+        }
+
+        Ok(result)
+    }
+
+    /// ## Prerequests:
+    /// - mode: Client
+    /// - configured Accesspoint
+    pub async fn async_connect_to_accesspoint(
+        &mut self,
+    ) -> Result<Option<ClientIpStatus>, EspError> {
+        {
+            let mut shared = self.waitable.state.lock();
+            shared.status.0 = ClientStatus::Started(ClientConnectionStatus::Connecting);
+        }
+
+        let status_change_poller = StatusChangeFuture::new(self.waitable.to_owned());
+        esp_nofail!(unsafe { esp_wifi_connect() });
+
+        let ip = loop {
+            let status = status_change_poller.to_owned().await;
+            if !status.is_transitional() {
+                match status {
+                    Status(ClientStatus::Started(ClientConnectionStatus::Connected(ip)), _) => {
+                        break Some(ip.to_owned())
+                    }
+                    _ => break None,
+                }
+            }
+        };
+
+        Ok(ip)
+    }
+
+    pub async fn async_disable_ap(&mut self) -> Result<(), EspError> {
+        info!("Disable Accesspoint");
+
+        let status_change_poller = StatusChangeFuture::new(self.waitable.to_owned());
+        esp!(unsafe { esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_STA) })?;
+        if let Status(_, ApStatus::Stopped) = status_change_poller.await {
+            info!("Accesspoint disabled");
+            Ok(())
+        } else {
+            Err(EspError::from(ESP_ERR_TIMEOUT as i32).unwrap())
+        }
+    }
+
+    /// Starts WIFI.
+    ///
+    /// The WIFI must be configured with specific config before. The
+    /// param `mode` indicates on which event the function should wait until WIFI is
+    /// successfully turned on.
+    ///
+    /// This function returns when WIFI has successfully started. If not one of the correct
+    /// events are received, the function returns with an error `ESP_ERR_TIMEOUT`.
+    async fn async_start_wifi(&mut self, mode: Mode) -> Result<(), EspError> {
+        info!("Start in mode: {:?}", mode);
+        let status_change_poller = StatusChangeFuture::new(self.waitable.to_owned());
+
+        {
+            let mut shared = self.waitable.state.lock();
+            shared.status = mode.starting_status();
+            esp!(unsafe { esp_wifi_start() })?;
+        }
+
+        let res = loop {
+            let status = status_change_poller.to_owned().await;
+
+            match mode.has_status_successfully_transitioned(&status) {
+                TransitionState::None => break Err(EspError::from(ESP_ERR_TIMEOUT as i32).unwrap()),
+                TransitionState::Half => continue,
+                TransitionState::Full => {
+                    info!("Started");
+                    break Ok(());
+                }
+            }
+        };
+
+        res
+    }
+
+    /// Stops WIFI.
+    ///
+    /// If an Accesspoint is connected it will be disconnected.
+    /// Stops AP/Client (Frees AP data block).
+    /// Waits till status is `Stopped` for both modes.
+    /// If status not changes immediatly to `Stopped` it returns a timeout error.
+    async fn async_stop(&mut self) -> Result<(), EspError> {
+        info!("Stopping");
+
+        {
+            let shared = self.waitable.state.lock();
+            if let Status(ClientStatus::Stopped, ApStatus::Stopped) = shared.status {
+                return Ok(());
+            }
+        }
+
+        let status_change_poller = StatusChangeFuture::new(self.waitable.to_owned());
+
+        {
+            let mut shared = self.waitable.state.lock();
+            shared.operating = false;
+
+            if let Status(ClientStatus::Started(ClientConnectionStatus::Connected(_)), _) =
+                shared.status
+            {
+                esp!(unsafe { esp_wifi_disconnect() }).or_else(|err| {
+                    if err.code() == esp_idf_sys::ESP_ERR_WIFI_NOT_STARTED as esp_err_t {
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                })?;
+                info!("Disconnect requested");
+            }
+
+            esp!(unsafe { esp_wifi_stop() })?;
+            info!("Stop requested");
+        }
+
+        let res = loop {
+            let status = status_change_poller.to_owned().await;
+
+            match status {
+                Status(ClientStatus::Stopped, ApStatus::Stopped) => {
+                    info!("Stopped");
+                    break Ok(());
+                }
+                Status(ClientStatus::Stopped, _) | Status(_, ApStatus::Stopped) => continue,
+                _ => break Err(EspError::from(ESP_ERR_TIMEOUT as i32).unwrap()),
+            }
+        };
+
+        res
+    }
+
+    pub async fn async_do_scan(
+        &mut self,
+        scan_config: Option<ScanConfig>,
+    ) -> Result<usize, EspError> {
+        info!(
+            "About to scan for access points with config: {:?}",
+            scan_config
+        );
+
+        let on_scan_finished =
+            EventOccureFuture::new(self.waitable.to_owned(), Some(WifiEvent::ScanDone));
+
+        let scan_config = scan_config.map(wifi_scan_config_t::from);
+        esp!(unsafe {
+            esp_wifi_scan_start(
+                scan_config
+                    .as_ref()
+                    .map_or(ptr::null(), |s| s as *const wifi_scan_config_t),
+                false,
+            )
+        })?;
+        let _ = on_scan_finished.await;
+
+        let mut found_ap: u16 = 0;
+        esp!(unsafe { esp_wifi_scan_get_ap_num(&mut found_ap as *mut _) })?;
+
+        info!("Found {} access points", found_ap);
+
+        Ok(usize::from(found_ap))
+    }
+
+    fn update_ap_conf_if_new(&mut self, conf: &AccessPointConfiguration) -> Result<(), EspError> {
+        match self.get_ap_conf() {
+            Ok(curr_conf) if !curr_conf.eq(conf) => self.set_ap_conf(conf)?,
+            _ => (),
+        }
+
+        Ok(())
+    }
+
+    fn update_client_conf_if_new(&mut self, conf: &ClientConfiguration) -> Result<(), EspError> {
+        match self.get_client_conf() {
+            Ok(curr_conf) if !curr_conf.eq(conf) => self.set_client_conf(conf)?,
+            _ => (),
+        }
+
+        Ok(())
+    }
+
+    /// Sets a specific configuration.
+    ///
+    /// The given configuration will be applied. This function does not start the wifi.
+    ///
+    /// The parameter `configure_client` indicates for config `Configuration::Mixed` if the
+    /// client configuration should be applied or not. This can be used if the board operates in
+    /// accesspoint mode and the client mode is used for scanning reachable accesspoints.
+    pub async fn async_set_configuration(
+        &mut self,
+        conf: &Configuration,
+        configure_client: bool,
+    ) -> Result<(), EspError> {
+        info!("Setting configuration: {:?}", conf);
+
+        unsafe {
+            match conf {
+                Configuration::None => {
+                    esp!(esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_NULL))?;
+                    info!("Wifi mode NULL set");
+                }
+                Configuration::AccessPoint(ap_conf) => {
+                    esp!(esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_AP))?;
+                    info!("Wifi mode AP set");
+                    self.update_ap_conf_if_new(ap_conf)?;
+                }
+                Configuration::Client(client_conf) => {
+                    esp!(esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_STA))?;
+                    info!("Wifi mode STA set");
+
+                    self.update_client_conf_if_new(client_conf)?;
+                }
+                Configuration::Mixed(client_conf, ap_conf) => {
+                    esp!(esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_APSTA))?;
+                    info!("Wifi mode APSTA set");
+
+                    self.update_ap_conf_if_new(ap_conf)?;
+                    if configure_client {
+                        self.update_client_conf_if_new(client_conf)?;
+                    }
+                }
+            }
+        };
+
+        Ok(())
+    }
+
+    pub async fn async_start_with_configuration(
+        &mut self,
+        conf: &Configuration,
+        configure_client: bool,
+    ) -> Result<(), EspError> {
+        info!("Start configured");
+
+        self.async_stop().await?;
+
+        self.async_set_configuration(conf, configure_client).await?;
+
+        let mode = Mode::from(conf.to_owned());
+        self.async_start_wifi(mode).await?;
+
+        info!("Configuration set");
+
+        Ok(())
     }
 }
 
@@ -1118,12 +1555,88 @@ impl EventBus<()> for EspWifi {
 }
 
 #[cfg(feature = "experimental")]
-mod asyncify {
-    use embedded_svc::utils::asyncify::{event_bus::AsyncEventBus, Asyncify};
+pub mod asyncify {
+    use core::{cell::RefCell, future::Future, task::Poll};
+
+    use alloc::{rc::Rc, sync::Arc};
+    use embedded_svc::{
+        utils::asyncify::{event_bus::AsyncEventBus, Asyncify},
+        wifi::Status,
+    };
 
     use esp_idf_hal::mutex::Condvar;
 
+    use crate::private::waitable::Waitable;
+
+    use super::WifiEvent;
+
     impl Asyncify for super::EspWifi {
         type AsyncWrapper<S> = AsyncEventBus<(), Condvar, S>;
+    }
+
+    pub(super) struct EventOccureFuture {
+        shared: Arc<Waitable<super::Shared>>,
+        event: Option<WifiEvent>,
+    }
+
+    impl EventOccureFuture {
+        pub fn new(shared: Arc<Waitable<super::Shared>>, event: Option<WifiEvent>) -> Self {
+            let _ = shared.state.lock().last_wifi_event.take();
+            Self { shared, event }
+        }
+    }
+
+    impl Future for EventOccureFuture {
+        type Output = WifiEvent;
+
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Self::Output> {
+            let mut shared = self.shared.state.lock();
+            if let Some(event) = shared.last_wifi_event.take() {
+                if self.event.is_some() && event.eq(&self.event.unwrap()) || self.event.is_none() {
+                    return Poll::Ready(event);
+                }
+            }
+
+            shared.status_change_wakers.register(cx.waker().to_owned());
+            Poll::Pending
+        }
+    }
+
+    #[derive(Clone)]
+    pub(super) struct StatusChangeFuture {
+        shared: Arc<Waitable<super::Shared>>,
+        last_status: Rc<RefCell<Status>>,
+    }
+
+    impl StatusChangeFuture {
+        pub fn new(shared: Arc<Waitable<super::Shared>>) -> Self {
+            let curr_status = { shared.state.lock().status.to_owned() };
+            Self {
+                last_status: Rc::new(RefCell::new(curr_status)),
+                shared,
+            }
+        }
+    }
+
+    impl Future for StatusChangeFuture {
+        type Output = Status;
+
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            let new_status = { self.shared.state.lock().status.to_owned() };
+            if !self.last_status.borrow().eq(&new_status) {
+                let _ = self.last_status.replace(new_status.to_owned());
+                return Poll::Ready(new_status);
+            }
+
+            let mut shared = self.shared.state.lock();
+            shared.status_change_wakers.register(cx.waker().to_owned());
+            Poll::Pending
+        }
     }
 }
