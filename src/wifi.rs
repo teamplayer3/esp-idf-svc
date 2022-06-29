@@ -841,6 +841,7 @@ impl EspWifi {
                     shared.status.0 = Self::reconnect_if_operating(shared.operating)?;
                 } else {
                     shared.status.0 = status;
+                    shared.status_change_wakers.awake_all();
                 }
 
                 info!(
@@ -993,10 +994,13 @@ impl EspWifi {
         }
 
         let status_change_poller = StatusChangeFuture::new(self.waitable.to_owned());
+        info!("start connecting to accesspoint");
         esp_nofail!(unsafe { esp_wifi_connect() });
 
+        info!("wait for connection established");
         let ip = loop {
             let status = status_change_poller.to_owned().await;
+            info!("got status {:?}", status);
             if !status.is_transitional() {
                 match status {
                     Status(ClientStatus::Started(ClientConnectionStatus::Connected(ip)), _) => {
@@ -1556,9 +1560,9 @@ impl EventBus<()> for EspWifi {
 
 #[cfg(feature = "experimental")]
 pub mod asyncify {
-    use core::{cell::RefCell, future::Future, task::Poll};
+    use core::{future::Future, task::Poll};
 
-    use alloc::{rc::Rc, sync::Arc};
+    use alloc::sync::Arc;
     use embedded_svc::{
         utils::asyncify::{event_bus::AsyncEventBus, Asyncify},
         wifi::Status,
@@ -1633,7 +1637,6 @@ pub mod asyncify {
                 *self.last_status.lock() = new_status.to_owned();
                 return Poll::Ready(new_status);
             }
-
             let mut shared = self.shared.state.lock();
             shared.status_change_wakers.register(cx.waker().to_owned());
             Poll::Pending
