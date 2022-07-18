@@ -272,6 +272,8 @@ struct Shared {
     ap_netif: Option<EspNetif>,
 
     #[cfg(feature = "experimental")]
+    on_disconnect_client: Option<Box<dyn FnMut()>>,
+    #[cfg(feature = "experimental")]
     status_change_wakers: WakerRegistry,
     #[cfg(feature = "experimental")]
     last_wifi_event: Option<WifiEvent>,
@@ -301,6 +303,8 @@ impl Default for Shared {
             sta_netif: None,
             ap_netif: None,
 
+            #[cfg(feature = "experimental")]
+            on_disconnect_client: Default::default(),
             #[cfg(feature = "experimental")]
             status_change_wakers: WakerRegistry::new(),
             #[cfg(feature = "experimental")]
@@ -785,6 +789,12 @@ impl EspWifi {
                 None,
             ),
             WifiEvent::StaDisconnected => {
+                #[cfg(feature = "experimental")]
+                {
+                    if let Some(func) = shared.on_disconnect_client.as_mut() {
+                        func()
+                    }
+                }
                 (Some(Self::reconnect_if_operating(shared.operating)?), None)
             }
             WifiEvent::ApStarted => (None, Some(ApStatus::Started(ApIpStatus::Done))),
@@ -949,6 +959,11 @@ impl From<Configuration> for Mode {
 
 #[cfg(feature = "experimental")]
 impl EspWifi {
+    pub fn set_callback_on_disconnect<F: FnMut() + 'static>(&mut self, callback: F) {
+        let mut shared = self.waitable.state.lock();
+        let _ = shared.on_disconnect_client.insert(Box::new(callback));
+    }
+
     pub fn wait_for_wifi_event(&mut self, event: WifiEvent) -> impl Future<Output = WifiEvent> {
         EventOccureFuture::new(self.waitable.to_owned(), Some(event))
     }
