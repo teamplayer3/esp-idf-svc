@@ -5,16 +5,13 @@ use core::ptr;
 use core::time::Duration;
 
 extern crate alloc;
-use alloc::borrow::ToOwned;
 use alloc::sync::Arc;
-use alloc::vec;
 
 use ::log::*;
 
 use enumset::*;
 
-use embedded_svc::errors::Errors;
-use embedded_svc::event_bus::EventBus;
+use embedded_svc::event_bus::{ErrorType, EventBus};
 use embedded_svc::ipv4;
 use embedded_svc::wifi::*;
 
@@ -102,8 +99,6 @@ impl From<ScanConfig> for wifi_scan_config_t {
     }
 }
 
-const MAX_AP: usize = 20;
-
 impl From<AuthMethod> for Newtype<wifi_auth_mode_t> {
     fn from(method: AuthMethod) -> Self {
         Newtype(match method {
@@ -165,8 +160,8 @@ impl From<&ClientConfiguration> for Newtype<wifi_sta_config_t> {
             ..Default::default()
         };
 
-        set_str(&mut result.ssid, conf.ssid.as_str());
-        set_str(&mut result.password, conf.password.as_str());
+        set_str(&mut result.ssid, conf.ssid.as_ref());
+        set_str(&mut result.password, conf.password.as_ref());
 
         Newtype(result)
     }
@@ -174,7 +169,7 @@ impl From<&ClientConfiguration> for Newtype<wifi_sta_config_t> {
 
 impl From<Newtype<wifi_sta_config_t>> for ClientConfiguration {
     fn from(conf: Newtype<wifi_sta_config_t>) -> Self {
-        ClientConfiguration {
+        Self {
             ssid: from_cstr(&conf.0.ssid).into(),
             bssid: if conf.0.bssid_set {
                 Some(conf.0.bssid)
@@ -207,8 +202,8 @@ impl From<&AccessPointConfiguration> for Newtype<wifi_ap_config_t> {
             ..Default::default()
         };
 
-        set_str(&mut result.ssid, conf.ssid.as_str());
-        set_str(&mut result.password, conf.password.as_str());
+        set_str(&mut result.ssid, conf.ssid.as_ref());
+        set_str(&mut result.password, conf.password.as_ref());
 
         Newtype(result)
     }
@@ -216,13 +211,12 @@ impl From<&AccessPointConfiguration> for Newtype<wifi_ap_config_t> {
 
 impl From<Newtype<wifi_ap_config_t>> for AccessPointConfiguration {
     fn from(conf: Newtype<wifi_ap_config_t>) -> Self {
-        AccessPointConfiguration {
+        Self {
             ssid: if conf.0.ssid_len == 0 {
                 from_cstr(&conf.0.ssid).into()
             } else {
                 unsafe {
-                    core::str::from_utf8_unchecked(&conf.0.ssid[0..conf.0.ssid_len as usize])
-                        .to_owned()
+                    core::str::from_utf8_unchecked(&conf.0.ssid[0..conf.0.ssid_len as usize]).into()
                 }
             },
             ssid_hidden: conf.0.ssid_hidden != 0,
@@ -1258,11 +1252,9 @@ impl Drop for EspWifi {
     }
 }
 
-impl Errors for EspWifi {
-    type Error = EspError;
-}
-
 impl Wifi for EspWifi {
+    type Error = EspError;
+
     fn get_capabilities(&self) -> Result<EnumSet<Capability>, Self::Error> {
         let caps = Capability::Client | Capability::AccessPoint | Capability::Mixed;
 
@@ -1280,35 +1272,35 @@ impl Wifi for EspWifi {
     }
 
     #[allow(non_upper_case_globals)]
-    fn scan_fill(&mut self, ap_infos: &mut [AccessPointInfo]) -> Result<usize, Self::Error> {
+    fn scan_n<const N: usize>(
+        &mut self,
+    ) -> Result<(heapless::Vec<AccessPointInfo, N>, usize), Self::Error> {
         let total_count = self.do_scan()?;
 
-        if !ap_infos.is_empty() {
-            let mut ap_infos_raw: [wifi_ap_record_t; MAX_AP] = Default::default();
+        let mut ap_infos_raw: heapless::Vec<wifi_ap_record_t, N> = heapless::Vec::new();
 
-            let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
+        let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
 
-            for i in 0..real_count {
-                if ap_infos.len() == i {
-                    break;
-                }
+        let mut result = heapless::Vec::<_, N>::new();
+        for ap_info_raw in ap_infos_raw.iter().take(real_count) {
+            let ap_info: AccessPointInfo = Newtype(ap_info_raw).into();
+            info!("Found access point {:?}", ap_info);
 
-                let ap_info = Newtype(&ap_infos_raw[i]).into();
-                info!("Found access point {:?}", ap_info);
-
-                ap_infos[i] = ap_info;
+            if result.push(ap_info).is_err() {
+                break;
             }
         }
 
-        Ok(cmp::min(total_count, MAX_AP))
+        Ok((result, total_count))
     }
 
     #[allow(non_upper_case_globals)]
-    fn scan(&mut self) -> Result<vec::Vec<AccessPointInfo>, Self::Error> {
+    fn scan(&mut self) -> Result<alloc::vec::Vec<AccessPointInfo>, Self::Error> {
         let total_count = self.do_scan()?;
 
-        let mut ap_infos_raw: vec::Vec<wifi_ap_record_t> =
-            vec::Vec::with_capacity(total_count as usize);
+        let mut ap_infos_raw: alloc::vec::Vec<wifi_ap_record_t> =
+            alloc::vec::Vec::with_capacity(total_count as usize);
+
         #[allow(clippy::uninit_vec)]
         // ... because we are filling it in on the next line and only reading the initialized members
         unsafe {
@@ -1317,7 +1309,7 @@ impl Wifi for EspWifi {
 
         let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
 
-        let mut result = vec::Vec::with_capacity(real_count);
+        let mut result = alloc::vec::Vec::with_capacity(real_count);
         for ap_info_raw in ap_infos_raw.iter().take(real_count) {
             let ap_info: AccessPointInfo = Newtype(ap_info_raw).into();
             info!("Found access point {:?}", ap_info);
@@ -1494,6 +1486,10 @@ impl EspTypedEventDeserializer<WifiEvent> for WifiEvent {
 
         f(&event)
     }
+}
+
+impl ErrorType for EspWifi {
+    type Error = EspError;
 }
 
 impl EventBus<()> for EspWifi {

@@ -2,7 +2,6 @@ use core::{mem, ptr, time::Duration};
 
 use ::log::*;
 
-use embedded_svc::errors::Errors;
 use embedded_svc::ipv4;
 use embedded_svc::ping::*;
 
@@ -29,12 +28,13 @@ impl EspPing {
         tracker: &mut Tracker<F>,
     ) -> Result<(), EspError> {
         #[allow(clippy::needless_update)]
+        #[allow(clippy::useless_conversion)]
         let config = esp_ping_config_t {
             count: conf.count,
             interval_ms: conf.interval.as_millis() as u32,
             timeout_ms: conf.timeout.as_millis() as u32,
             data_size: conf.data_size,
-            tos: conf.tos,
+            tos: conf.tos.into(),
             target_addr: ip_addr_t {
                 u_addr: ip_addr__bindgen_ty_1 {
                     ip4: Newtype::<ip4_addr_t>::from(ip).0,
@@ -255,11 +255,9 @@ impl EspPing {
     }
 }
 
-impl Errors for EspPing {
-    type Error = EspError;
-}
-
 impl Ping for EspPing {
+    type Error = EspError;
+
     fn ping(&mut self, ip: ipv4::Ipv4Addr, conf: &Configuration) -> Result<Summary, Self::Error> {
         info!(
             "About to run a summary ping {} with configuration {:?}",
