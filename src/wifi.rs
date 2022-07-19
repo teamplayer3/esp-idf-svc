@@ -965,11 +965,11 @@ impl EspWifi {
     pub async fn async_scan(
         &mut self,
         scan_config: Option<ScanConfig>,
-    ) -> Result<vec::Vec<AccessPointInfo>, EspError> {
+    ) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
         let total_count = self.async_do_scan(scan_config).await?;
 
-        let mut ap_infos_raw: vec::Vec<wifi_ap_record_t> =
-            vec::Vec::with_capacity(total_count as usize);
+        let mut ap_infos_raw: alloc::vec::Vec<wifi_ap_record_t> =
+            alloc::vec::Vec::with_capacity(total_count as usize);
         #[allow(clippy::uninit_vec)]
         // ... because we are filling it in on the next line and only reading the initialized members
         unsafe {
@@ -978,7 +978,7 @@ impl EspWifi {
 
         let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
 
-        let mut result = vec::Vec::with_capacity(real_count);
+        let mut result = alloc::vec::Vec::with_capacity(real_count);
         for ap_info_raw in ap_infos_raw.iter().take(real_count) {
             let ap_info: AccessPointInfo = Newtype(ap_info_raw).into();
 
