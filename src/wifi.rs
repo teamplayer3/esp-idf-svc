@@ -501,6 +501,7 @@ impl EspWifi {
         };
 
         esp!(unsafe { esp_wifi_set_config(wifi_interface_t_WIFI_IF_AP, &mut wifi_config) })?;
+
         self.set_router_ip_conf(&conf.ip_conf)?;
 
         info!("AP configuration done");
@@ -512,10 +513,8 @@ impl EspWifi {
         &mut self,
         conf: &Option<ipv4::ClientConfiguration>,
     ) -> Result<(), EspError> {
-        {
-            let mut shared = self.waitable.state.lock();
-            Self::netif_unbind(shared.sta_netif.as_mut())?;
-        }
+        let mut shared = self.waitable.state.lock();
+        Self::netif_unbind(shared.sta_netif.as_mut())?;
 
         let netif = if let Some(conf) = conf {
             let mut iconf = InterfaceConfiguration::wifi_default_client();
@@ -523,7 +522,10 @@ impl EspWifi {
 
             info!("Setting STA interface configuration: {:?}", iconf);
 
-            let netif = EspNetif::new(self.netif_stack.clone(), &iconf)?;
+            let netif = match shared.sta_netif.take() {
+                Some(netif) => netif,
+                None => EspNetif::new(self.netif_stack.clone(), &iconf)?,
+            };
 
             esp!(unsafe { esp_netif_attach_wifi_station(netif.1) })?;
             esp!(unsafe { esp_wifi_set_default_wifi_sta_handlers() })?;
@@ -537,11 +539,8 @@ impl EspWifi {
             None
         };
 
-        {
-            let mut shared = self.waitable.state.lock();
-            shared.client_ip_conf = conf.clone();
-            shared.sta_netif = netif;
-        }
+        shared.client_ip_conf = conf.clone();
+        shared.sta_netif = netif;
 
         Ok(())
     }
@@ -550,10 +549,8 @@ impl EspWifi {
         &mut self,
         conf: &Option<ipv4::RouterConfiguration>,
     ) -> Result<(), EspError> {
-        {
-            let mut shared = self.waitable.state.lock();
-            Self::netif_unbind(shared.ap_netif.as_mut())?;
-        }
+        let mut shared = self.waitable.state.lock();
+        Self::netif_unbind(shared.ap_netif.as_mut())?;
 
         let netif = if let Some(conf) = conf {
             let mut iconf = InterfaceConfiguration::wifi_default_router();
@@ -561,7 +558,10 @@ impl EspWifi {
 
             info!("Setting AP interface configuration: {:?}", iconf);
 
-            let netif = EspNetif::new(self.netif_stack.clone(), &iconf)?;
+            let netif = match shared.ap_netif.take() {
+                Some(netif) => netif,
+                None => EspNetif::new(self.netif_stack.clone(), &iconf)?,
+            };
 
             esp!(unsafe { esp_netif_attach_wifi_ap(netif.1) })?;
             esp!(unsafe { esp_wifi_set_default_wifi_ap_handlers() })?;
@@ -575,11 +575,8 @@ impl EspWifi {
             None
         };
 
-        {
-            let mut shared = self.waitable.state.lock();
-            shared.router_ip_conf = *conf;
-            shared.ap_netif = netif;
-        }
+        shared.router_ip_conf = *conf;
+        shared.ap_netif = netif;
 
         Ok(())
     }
@@ -621,7 +618,7 @@ impl EspWifi {
             let mut shared = self.waitable.state.lock();
 
             shared.status = status.clone();
-            shared.operating = status.is_operating();
+            shared.operating = false; // status.is_operating();
 
             if status.is_operating() {
                 info!("Status is of operating type, starting");
@@ -1062,6 +1059,8 @@ impl EspWifi {
 
         let res = loop {
             let status = status_change_poller.to_owned().await;
+
+            info!("new state: {:?}", status);
 
             match mode.has_status_successfully_transitioned(&status) {
                 TransitionState::None => break Err(EspError::from(ESP_ERR_TIMEOUT as i32).unwrap()),
