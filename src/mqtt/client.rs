@@ -351,6 +351,13 @@ impl<S> EspMqttClient<S> {
     }
 }
 
+impl<S> EspMqttClient<S> {
+    pub fn queue_size(&self) -> usize {
+        let size = unsafe { esp_mqtt_client_get_outbox_size(self.raw_client) };
+        size as usize
+    }
+}
+
 impl<P> Drop for EspMqttClient<P> {
     fn drop(&mut self) {
         let connection_state = mem::replace(&mut self.conn_state_guard, None);
