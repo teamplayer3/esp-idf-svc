@@ -12,6 +12,8 @@ use crate::nvs::*;
 
 use crate::private::cstr::*;
 
+use log::info;
+
 enum EspNvsRef {
     Default(Arc<EspDefaultNvs>),
     Nvs(Arc<EspNvs>),
@@ -68,6 +70,13 @@ impl EspNvsStorage {
     }
 }
 
+impl EspNvsStorage {
+    pub fn erase_all(&mut self) -> Result<(), EspError> {
+        esp!(unsafe { nvs_erase_all(self.1) })?;
+        esp!(unsafe { nvs_commit(self.1) })
+    }
+}
+
 impl Drop for EspNvsStorage {
     fn drop(&mut self) {
         unsafe {
@@ -104,11 +113,13 @@ impl RawStorage for EspNvsStorage {
     fn len(&self, name: &str) -> Result<Option<usize>, Self::Error> {
         let c_key = CString::new(name).unwrap();
 
+        info!("1");
         let mut value: u_int64_t = 0;
 
         // check for u64 value
         match unsafe { nvs_get_u64(self.1, c_key.as_ptr(), &mut value as *mut _) } {
             ESP_ERR_NVS_NOT_FOUND => {
+                info!("2");
                 // check for blob value, by getting blob length
                 let mut len: size_t = 0;
                 match unsafe {
@@ -116,6 +127,7 @@ impl RawStorage for EspNvsStorage {
                 } {
                     ESP_ERR_NVS_NOT_FOUND => Ok(None),
                     err => {
+                        info!("3");
                         // bail on error
                         esp!(err)?;
 
