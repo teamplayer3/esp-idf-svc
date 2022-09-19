@@ -113,13 +113,11 @@ impl RawStorage for EspNvsStorage {
     fn len(&self, name: &str) -> Result<Option<usize>, Self::Error> {
         let c_key = CString::new(name).unwrap();
 
-        info!("1");
         let mut value: u_int64_t = 0;
 
         // check for u64 value
         match unsafe { nvs_get_u64(self.1, c_key.as_ptr(), &mut value as *mut _) } {
             ESP_ERR_NVS_NOT_FOUND => {
-                info!("2");
                 // check for blob value, by getting blob length
                 let mut len: size_t = 0;
                 match unsafe {
@@ -127,7 +125,6 @@ impl RawStorage for EspNvsStorage {
                 } {
                     ESP_ERR_NVS_NOT_FOUND => Ok(None),
                     err => {
-                        info!("3");
                         // bail on error
                         esp!(err)?;
 
@@ -169,6 +166,8 @@ impl RawStorage for EspNvsStorage {
                         // bail on error
                         esp!(err)?;
 
+                        len = buf.len() as _;
+
                         // fetch value if no error
                         esp!(unsafe {
                             nvs_get_blob(
@@ -179,7 +178,7 @@ impl RawStorage for EspNvsStorage {
                             )
                         })?;
 
-                        Ok(Some((&buf[..min(buf.len(), len as usize)], len as _)))
+                        Ok(Some((&buf[..len as usize], len as usize)))
                     }
                 }
             }
@@ -189,6 +188,12 @@ impl RawStorage for EspNvsStorage {
 
                 // u64 value was found, decode it
                 let len: u8 = (u64value & 0xff) as u8;
+
+                if buf.len() < len as _ {
+                    // Buffer not large enough
+                    return Err(EspError::from(ESP_ERR_NVS_INVALID_LENGTH).unwrap());
+                }
+
                 u64value >>= 8;
 
                 let array: [u8; 7] = [
@@ -201,9 +206,9 @@ impl RawStorage for EspNvsStorage {
                     ((u64value >> 48) & 0xff) as u8,
                 ];
 
-                buf.copy_from_slice(&array[..min(buf.len(), len as usize)]);
+                buf[..len as usize].copy_from_slice(&array[..len as usize]);
 
-                Ok(Some((&buf[..min(buf.len(), len as usize)], len as _)))
+                Ok(Some((&buf[..len as usize], len as usize)))
             }
         }
     }
@@ -241,18 +246,3 @@ impl RawStorage for EspNvsStorage {
         Ok(true)
     }
 }
-
-// TODO
-// impl Storage for EspNvsStorage {
-//     fn get<'a, T>(&'a self, name: &str) -> Result<Option<T>, Self::Error>
-//     where
-//         T: serde::Deserialize<'a> {
-//         todo!()
-//     }
-
-//     fn set<T>(&mut self, name: &str, value: &T) -> Result<bool, Self::Error>
-//     where
-//         T: serde::Serialize {
-//         todo!()
-//     }
-// }
