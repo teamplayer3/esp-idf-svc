@@ -455,6 +455,24 @@ impl EspNetif {
 
         Ok(())
     }
+
+    pub fn is_own_netif_handle(&self, handle: NetifHandle) -> bool {
+        (handle as *const esp_netif_obj) == self.1
+    }
+
+    pub fn attach_wifi_station(&self) -> Result<(), EspError> {
+        esp!(unsafe { esp_netif_attach_wifi_station(self.1) })
+    }
+
+    pub fn attach_wifi_ap(&self) -> Result<(), EspError> {
+        esp!(unsafe { esp_netif_attach_wifi_ap(self.1) })
+    }
+
+    pub fn clear_default_wifi_driver_and_handlers(&self) -> Result<(), EspError> {
+        esp!(unsafe {
+            esp_wifi_clear_default_wifi_driver_and_handlers(self.1 as *mut c_types::c_void)
+        })
+    }
 }
 
 impl Drop for EspNetif {
