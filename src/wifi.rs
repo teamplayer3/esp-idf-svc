@@ -842,6 +842,7 @@ impl EspWifi {
                     shared.status.0 = Self::reconnect_if_operating(shared.operating)?;
                 } else {
                     shared.status.0 = status;
+                    #[cfg(feature = "experimental")]
                     shared.status_change_wakers.awake_all();
                 }
 
