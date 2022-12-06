@@ -890,6 +890,7 @@ enum Mode {
     ApClient,
 }
 
+#[cfg(feature = "experimental")]
 #[derive(Debug, Clone, Copy)]
 enum TransitionState {
     None,
@@ -898,6 +899,7 @@ enum TransitionState {
 }
 
 impl Mode {
+    #[cfg(feature = "experimental")]
     pub fn starting_status(&self) -> Status {
         match self {
             Self::None => Status(ClientStatus::Stopped, ApStatus::Stopped),
@@ -907,6 +909,7 @@ impl Mode {
         }
     }
 
+    #[cfg(feature = "experimental")]
     pub fn has_status_successfully_transitioned(&self, status: &Status) -> TransitionState {
         match self {
             Self::None => {
