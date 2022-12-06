@@ -7,7 +7,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use ::log::*;
+use log::*;
 
 use enumset::*;
 
@@ -183,6 +183,74 @@ impl From<Newtype<&wifi_ap_record_t>> for AccessPointInfo {
     }
 }
 
+/// more info: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi.html?highlight=wifi%20scan#esp32-wi-fi-scan
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ScanType {
+    Active = 0,
+    Passive = 1,
+}
+
+impl From<ScanType> for u32 {
+    fn from(s: ScanType) -> Self {
+        match s {
+            ScanType::Active => 0,
+            ScanType::Passive => 1,
+        }
+    }
+}
+
+impl Default for ScanType {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+/// more info: https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi.html?highlight=wifi%20scan#esp32-wi-fi-scan
+#[derive(Debug)]
+pub struct ScanTime {
+    pub active: (u32, u32),
+    pub passive: u32,
+}
+
+impl Default for ScanTime {
+    fn default() -> Self {
+        Self {
+            active: (0, 0),
+            passive: 0,
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct ScanConfig {
+    pub bssid: Option<[u8; 8]>,
+    pub ssid: Option<String>,
+    pub channel: Option<u8>,
+    pub scan_type: ScanType,
+    pub scan_time: ScanTime,
+    pub show_hidden: bool,
+}
+
+impl From<&ScanConfig> for wifi_scan_config_t {
+    fn from(s: &ScanConfig) -> Self {
+        Self {
+            bssid: s.bssid.map_or(ptr::null(), |v| v.as_ptr()) as *mut u8,
+            ssid: s.ssid.as_ref().map_or(ptr::null(), |v| v.as_ptr()) as *mut u8,
+            scan_time: wifi_scan_time_t {
+                active: wifi_active_scan_time_t {
+                    min: s.scan_time.active.0,
+                    max: s.scan_time.active.1,
+                },
+                passive: s.scan_time.passive,
+            },
+            channel: s.channel.unwrap_or_default(),
+            scan_type: s.scan_type.into(),
+            show_hidden: s.show_hidden,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum WifiDeviceId {
     Ap,
@@ -196,6 +264,13 @@ impl From<WifiDeviceId> for wifi_interface_t {
             WifiDeviceId::Sta => wifi_interface_t_WIFI_IF_STA,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WifiDriverMode {
+    Ap,
+    Sta,
+    ApSta,
 }
 
 #[allow(non_upper_case_globals)]
@@ -355,6 +430,16 @@ impl<'d> WifiDriver<'d> {
         info!("Providing capabilities: {:?}", caps);
 
         Ok(caps)
+    }
+
+    pub fn set_mode(&mut self, mode: WifiDriverMode) -> Result<(), EspError> {
+        let mode = match mode {
+            WifiDriverMode::Ap => wifi_mode_t_WIFI_MODE_AP,
+            WifiDriverMode::Sta => wifi_mode_t_WIFI_MODE_STA,
+            WifiDriverMode::ApSta => wifi_mode_t_WIFI_MODE_APSTA,
+        };
+
+        esp!(unsafe { esp_wifi_set_mode(mode) })
     }
 
     pub fn start(&mut self) -> Result<(), EspError> {
@@ -693,6 +778,41 @@ impl<'d> WifiDriver<'d> {
         info!("Driver deinitialized");
 
         Ok(())
+    }
+
+    fn start_scan(&mut self, scan_config: &ScanConfig) -> Result<(), EspError> {
+        info!("About to scan for access points");
+
+        let scan_config: wifi_scan_config_t = scan_config.into();
+
+        esp!(unsafe { esp_wifi_scan_start(&scan_config as *const wifi_scan_config_t, false) })
+    }
+
+    fn stop_scan(&mut self) -> Result<(), EspError> {
+        esp!(unsafe { esp_wifi_scan_stop() })
+    }
+
+    fn get_scan_result(&mut self) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
+        let mut total_count: u16 = 0;
+        esp!(unsafe { esp_wifi_scan_get_ap_num(&mut total_count as *mut _) })?;
+
+        let mut ap_infos_raw: alloc::vec::Vec<wifi_ap_record_t> =
+            alloc::vec::Vec::with_capacity(total_count as usize);
+        #[allow(clippy::uninit_vec)]
+        // ... because we are filling it in on the next line and only reading the initialized members
+        unsafe {
+            ap_infos_raw.set_len(total_count as usize)
+        };
+
+        let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
+
+        let mut result = alloc::vec::Vec::with_capacity(real_count);
+        for ap_info_raw in ap_infos_raw.iter().take(real_count) {
+            let ap_info: AccessPointInfo = Newtype(ap_info_raw).into();
+
+            result.push(ap_info);
+        }
+        Ok(result)
     }
 
     #[allow(non_upper_case_globals)]
@@ -1222,6 +1342,263 @@ impl WifiWait {
                 | WifiEvent::StaDisconnected
         ) {
             waitable.cvar.notify_all();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanState {
+    Init,
+    Stared,
+    Done,
+}
+
+impl From<WifiEvent> for ScanState {
+    fn from(value: WifiEvent) -> Self {
+        match value {
+            WifiEvent::ScanStarted => Self::Stared,
+            WifiEvent::ScanDone => Self::Done,
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub struct ScanProcess<'d, 'a> {
+    waitable: Arc<Waitable<ScanState>>,
+    wifi_driver: &'d mut WifiDriver<'a>,
+    _subscription: EspSubscription<System>,
+}
+
+impl<'d, 'a> ScanProcess<'d, 'a> {
+    pub fn new(
+        sysloop: &EspEventLoop<System>,
+        wifi_driver: &'d mut WifiDriver<'a>,
+    ) -> Result<Self, EspError> {
+        let waitable: Arc<Waitable<ScanState>> = Arc::new(Waitable::new(ScanState::Init));
+
+        let s_waitable = waitable.clone();
+        let subscription =
+            sysloop.subscribe(move |event: &WifiEvent| Self::on_wifi_event(&s_waitable, event))?;
+
+        Ok(Self {
+            waitable,
+            wifi_driver,
+            _subscription: subscription,
+        })
+    }
+
+    pub fn scan(self, config: &ScanConfig) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
+        self.wifi_driver.start_scan(config)?;
+        self.waitable
+            .wait_while(|state| !matches!(state, ScanState::Done));
+        self.wifi_driver.get_scan_result()
+    }
+
+    fn on_wifi_event(waitable: &Waitable<ScanState>, event: &WifiEvent) {
+        info!("Got wifi event: {:?}", event);
+
+        if matches!(event, WifiEvent::ScanStarted | WifiEvent::ScanDone) {
+            *waitable.state.lock() = event.to_owned().into();
+            waitable.cvar.notify_all();
+        }
+    }
+
+    fn clear_scan_result_mem(&mut self) -> Result<(), EspError> {
+        self.wifi_driver.get_scan_result().map(|_| ())
+    }
+}
+
+impl Drop for ScanProcess<'_, '_> {
+    fn drop(&mut self) {
+        self.wifi_driver.stop_scan().unwrap();
+        self.clear_scan_result_mem().unwrap()
+    }
+}
+
+#[cfg(all(feature = "nightly", feature = "experimental"))]
+pub mod asyncify {
+    use core::{future::Future, task::Waker};
+
+    use alloc::sync::Arc;
+    use embedded_svc::wifi::AccessPointInfo;
+    use esp_idf_sys::EspError;
+
+    use log::info;
+
+    use crate::{
+        eventloop::{EspEventLoop, EspSubscription, System},
+        private::mutex::Mutex,
+    };
+
+    use super::{ScanConfig, ScanState, WifiDriver, WifiEvent};
+
+    #[derive(Clone)]
+    pub struct AsyncWaitable<T> {
+        state: Arc<Mutex<AsyncState<T>>>,
+    }
+
+    pub struct AsyncState<T> {
+        state: T,
+        waker: Option<Waker>,
+    }
+
+    impl<T> AsyncState<T> {
+        pub fn new(state: T) -> Self {
+            Self { state, waker: None }
+        }
+    }
+
+    impl<T> AsyncWaitable<T> {
+        pub fn new(state: T) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(AsyncState::new(state))),
+            }
+        }
+
+        pub fn wait_while(&self, condition: impl Fn(&T) -> bool + 'static) -> WaitFuture<T> {
+            WaitFuture {
+                state: self.state.to_owned(),
+                condition: Box::new(condition),
+            }
+        }
+
+        fn notify(&mut self) {
+            if let Some(waker) = self.state.lock().waker.take() {
+                waker.wake()
+            }
+        }
+
+        fn set_and_notify(&mut self, state: T) {
+            let mut inner_state = self.state.lock();
+            inner_state.state = state;
+            if let Some(waker) = inner_state.waker.take() {
+                waker.wake()
+            }
+        }
+    }
+
+    pub struct WaitFuture<T> {
+        state: Arc<Mutex<AsyncState<T>>>,
+        condition: Box<dyn Fn(&T) -> bool>,
+    }
+
+    impl<T> Future for WaitFuture<T> {
+        type Output = ();
+
+        fn poll(
+            self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Self::Output> {
+            let cond = {
+                let state = self.state.lock();
+                !(self.condition)(&state.state)
+            };
+
+            if cond {
+                core::task::Poll::Ready(())
+            } else {
+                self.state.lock().waker = Some(cx.waker().to_owned());
+                core::task::Poll::Pending
+            }
+        }
+    }
+
+    pub struct AsyncWifiWait {
+        waitable: AsyncWaitable<()>,
+        _subscription: EspSubscription<System>,
+    }
+
+    impl AsyncWifiWait {
+        pub fn new(sysloop: &EspEventLoop<System>) -> Result<Self, EspError> {
+            let waitable = AsyncWaitable::new(());
+
+            let mut s_waitable = waitable.clone();
+            let subscription = sysloop
+                .subscribe(move |event: &WifiEvent| Self::on_wifi_event(&mut s_waitable, event))?;
+
+            Ok(Self {
+                waitable,
+                _subscription: subscription,
+            })
+        }
+
+        pub async fn wait(&self, matcher: impl Fn() -> bool + 'static) {
+            info!("About to wait");
+
+            self.waitable.wait_while(move |_| !matcher()).await;
+
+            info!("Waiting done - success");
+        }
+
+        fn on_wifi_event(waitable: &mut AsyncWaitable<()>, event: &WifiEvent) {
+            info!("Got wifi event: {:?}", event);
+
+            if matches!(
+                event,
+                WifiEvent::ApStarted
+                    | WifiEvent::ApStopped
+                    | WifiEvent::StaStarted
+                    | WifiEvent::StaStopped
+                    | WifiEvent::StaConnected
+                    | WifiEvent::StaDisconnected
+            ) {
+                waitable.notify();
+            }
+        }
+    }
+
+    pub struct AsyncScanProcess<'d, 'a> {
+        waitable: AsyncWaitable<ScanState>,
+        wifi_driver: &'d mut WifiDriver<'a>,
+        _subscription: EspSubscription<System>,
+    }
+
+    impl<'d, 'a> AsyncScanProcess<'d, 'a> {
+        pub fn new(
+            sysloop: &EspEventLoop<System>,
+            wifi_driver: &'d mut WifiDriver<'a>,
+        ) -> Result<Self, EspError> {
+            let waitable: AsyncWaitable<ScanState> = AsyncWaitable::new(ScanState::Init);
+
+            let mut s_waitable = waitable.to_owned();
+            let subscription = sysloop
+                .subscribe(move |event: &WifiEvent| Self::on_wifi_event(&mut s_waitable, event))?;
+
+            Ok(Self {
+                waitable,
+                wifi_driver,
+                _subscription: subscription,
+            })
+        }
+
+        pub async fn scan(
+            self,
+            config: &ScanConfig,
+        ) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
+            self.wifi_driver.start_scan(config)?;
+            self.waitable
+                .wait_while(|state| !matches!(state, ScanState::Done))
+                .await;
+            self.wifi_driver.get_scan_result()
+        }
+
+        fn on_wifi_event(waitable: &mut AsyncWaitable<ScanState>, event: &WifiEvent) {
+            info!("Got wifi event: {:?}", event);
+
+            if matches!(event, WifiEvent::ScanStarted | WifiEvent::ScanDone) {
+                waitable.set_and_notify(event.to_owned().into());
+            }
+        }
+
+        fn clear_scan_result_mem(&mut self) -> Result<(), EspError> {
+            self.wifi_driver.get_scan_result().map(|_| ())
+        }
+    }
+
+    impl Drop for AsyncScanProcess<'_, '_> {
+        fn drop(&mut self) {
+            self.wifi_driver.stop_scan().unwrap();
+            self.clear_scan_result_mem().unwrap()
         }
     }
 }
