@@ -1432,34 +1432,48 @@ pub mod asyncify {
 
     use super::{ScanConfig, ScanState, WifiDriver, WifiEvent};
 
-    #[derive(Clone)]
-    pub struct AsyncWaitable<T> {
-        state: Arc<Mutex<AsyncState<T>>>,
+    trait AsyncConditionFunc<T, Ret>: Fn(Arc<Mutex<T>>) -> Ret {}
+
+    trait AsyncCondition<T>: Fn(Arc<Mutex<T>>) -> Self::OutputFuture {
+        type OutputFuture: Future<Output = <Self as AsyncCondition<T>>::Output>;
+        type Output;
     }
 
+    #[derive(Clone)]
+    pub struct AsyncWaitable<T> {
+        state: AsyncState<T>,
+    }
+
+    #[derive(Clone)]
     pub struct AsyncState<T> {
-        state: T,
-        waker: Option<Waker>,
+        state: Arc<Mutex<T>>,
+        waker: Arc<Mutex<Option<Waker>>>,
     }
 
     impl<T> AsyncState<T> {
         pub fn new(state: T) -> Self {
-            Self { state, waker: None }
+            Self {
+                state: Arc::new(Mutex::new(state)),
+                waker: Arc::new(Mutex::new(None)),
+            }
         }
     }
 
     impl<T> AsyncWaitable<T> {
         pub fn new(state: T) -> Self {
             Self {
-                state: Arc::new(Mutex::new(AsyncState::new(state))),
+                state: AsyncState::new(state),
             }
         }
 
-        pub fn wait_while(&self, condition: impl Fn(&T) -> bool + 'static) -> WaitFuture<T> {
-            WaitFuture {
-                state: self.state.to_owned(),
-                condition: Box::new(condition),
-            }
+        pub fn wait_while<C>(
+            &self,
+            condition: C,
+        ) -> WaitFuture<T, <C as AsyncCondition<T>>::OutputFuture>
+        where
+            C: AsyncCondition<T, Output = bool>,
+        {
+            WaitFuture::new(self.state.to_owned(), Box::new(condition))
         }
 
         fn notify(&mut self) {
@@ -1477,12 +1491,35 @@ pub mod asyncify {
         }
     }
 
-    pub struct WaitFuture<T> {
-        state: Arc<Mutex<AsyncState<T>>>,
-        condition: Box<dyn Fn(&T) -> bool>,
+    pub struct WaitFuture<T, F>
+    where
+        F: Future<Output = bool>,
+    {
+        state: AsyncState<T>,
+        condition_func: Box<dyn Fn(Arc<Mutex<T>>) -> F>,
+        condition_fut: Option<F>,
     }
 
-    impl<T> Future for WaitFuture<T> {
+    impl<T, F> WaitFuture<T, F>
+    where
+        F: Future<Output = bool>,
+    {
+        fn new(
+            state: Arc<Mutex<AsyncState<T>>>,
+            condition: Box<dyn Fn(Arc<Mutex<T>>) -> F>,
+        ) -> Self {
+            Self {
+                state,
+                condition_func: condition,
+                condition_fut: None,
+            }
+        }
+    }
+
+    impl<T, F> Future for WaitFuture<T, F>
+    where
+        F: Future<Output = bool>,
+    {
         type Output = ();
 
         fn poll(
@@ -1501,6 +1538,11 @@ pub mod asyncify {
                 core::task::Poll::Pending
             }
         }
+    }
+
+    trait AsyncMatcher: Fn() -> Self::OutputFuture {
+        type OutputFuture: Future<Output = <Self as AsyncMatcher>::Output>;
+        type Output;
     }
 
     pub struct AsyncWifiWait {
@@ -1522,10 +1564,12 @@ pub mod asyncify {
             })
         }
 
-        pub async fn wait(&self, matcher: impl Fn() -> bool + 'static) {
+        pub async fn wait(&self, matcher: impl AsyncMatcher<Output = bool>) {
             info!("About to wait");
 
-            self.waitable.wait_while(move |_| !matcher()).await;
+            self.waitable
+                .wait_while(move |_| async { !matcher().await })
+                .await;
 
             info!("Waiting done - success");
         }
