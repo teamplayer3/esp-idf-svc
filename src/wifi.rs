@@ -1417,7 +1417,7 @@ impl Drop for ScanProcess<'_, '_> {
 
 #[cfg(all(feature = "nightly", feature = "experimental"))]
 pub mod asyncify {
-    use core::{future::Future, task::Waker};
+    use core::{future::Future, pin::Pin, task::Waker};
 
     use alloc::sync::Arc;
     use embedded_svc::wifi::AccessPointInfo;
@@ -1444,10 +1444,18 @@ pub mod asyncify {
         state: AsyncState<T>,
     }
 
-    #[derive(Clone)]
     pub struct AsyncState<T> {
         state: Arc<Mutex<T>>,
         waker: Arc<Mutex<Option<Waker>>>,
+    }
+
+    impl<T> Clone for AsyncState<T> {
+        fn clone(&self) -> Self {
+            Self {
+                state: self.state.clone(),
+                waker: self.waker.clone(),
+            }
+        }
     }
 
     impl<T> AsyncState<T> {
@@ -1466,48 +1474,48 @@ pub mod asyncify {
             }
         }
 
-        pub fn wait_while<C>(
-            &self,
-            condition: C,
-        ) -> WaitFuture<T, <C as AsyncCondition<T>>::OutputFuture>
+        pub async fn wait_while<F, Fut>(&self, condition: F) -> WaitFuture<T, F, Fut>
         where
-            C: AsyncCondition<T, Output = bool>,
+            F: Fn(Arc<Mutex<T>>) -> Fut,
+            Fut: Future<Output = bool>,
         {
-            WaitFuture::new(self.state.to_owned(), Box::new(condition))
+            WaitFuture::new(self.state.to_owned(), condition)
         }
 
         fn notify(&mut self) {
-            if let Some(waker) = self.state.lock().waker.take() {
+            if let Some(waker) = self.state.waker.lock().take() {
                 waker.wake()
             }
         }
 
         fn set_and_notify(&mut self, state: T) {
-            let mut inner_state = self.state.lock();
-            inner_state.state = state;
-            if let Some(waker) = inner_state.waker.take() {
+            let inner_state = &mut self.state;
+            *inner_state.state.lock() = state;
+            if let Some(waker) = inner_state.waker.lock().take() {
                 waker.wake()
             }
         }
     }
 
-    pub struct WaitFuture<T, F>
-    where
-        F: Future<Output = bool>,
-    {
-        state: AsyncState<T>,
-        condition_func: Box<dyn Fn(Arc<Mutex<T>>) -> F>,
-        condition_fut: Option<F>,
+    pin_project_lite::pin_project! {
+        #[project = WaitFutureProj]
+        pub struct WaitFuture<T, F, Fut>
+        where
+            F: Fn(Arc<Mutex<T>>) -> Fut,
+            Fut: Future<Output = bool>,
+        {
+            state: AsyncState<T>,
+            condition_func: F,
+            condition_fut: Option<Pin<Box<Fut>>>,
+        }
     }
 
-    impl<T, F> WaitFuture<T, F>
+    impl<T, F, Fut> WaitFuture<T, F, Fut>
     where
-        F: Future<Output = bool>,
+        F: Fn(Arc<Mutex<T>>) -> Fut,
+        Fut: Future<Output = bool>,
     {
-        fn new(
-            state: Arc<Mutex<AsyncState<T>>>,
-            condition: Box<dyn Fn(Arc<Mutex<T>>) -> F>,
-        ) -> Self {
+        fn new(state: AsyncState<T>, condition: F) -> Self {
             Self {
                 state,
                 condition_func: condition,
@@ -1516,9 +1524,10 @@ pub mod asyncify {
         }
     }
 
-    impl<T, F> Future for WaitFuture<T, F>
+    impl<T, F, Fut> Future for WaitFuture<T, F, Fut>
     where
-        F: Future<Output = bool>,
+        F: Fn(Arc<Mutex<T>>) -> Fut,
+        Fut: Future<Output = bool>,
     {
         type Output = ();
 
@@ -1526,21 +1535,29 @@ pub mod asyncify {
             self: core::pin::Pin<&mut Self>,
             cx: &mut core::task::Context<'_>,
         ) -> core::task::Poll<Self::Output> {
-            let cond = {
-                let state = self.state.lock();
-                !(self.condition)(&state.state)
-            };
-
-            if cond {
-                core::task::Poll::Ready(())
-            } else {
-                self.state.lock().waker = Some(cx.waker().to_owned());
-                core::task::Poll::Pending
+            let this: WaitFutureProj<'_, T, F, Fut> = self.project();
+            if this.condition_fut.is_none() {
+                let fut = (this.condition_func)(this.state.state.to_owned());
+                let _ = this.condition_fut.insert(Box::pin(fut));
             }
+
+            if let Some(mut fut) = this.condition_fut.take() {
+                let poll = Pin::new(&mut fut).poll(cx);
+                if let core::task::Poll::Ready(res) = poll {
+                    if res {
+                        return core::task::Poll::Ready(());
+                    } else {
+                        let _ = this.state.waker.lock().insert(cx.waker().to_owned());
+                    }
+                } else {
+                    let _ = this.condition_fut.insert(fut);
+                }
+            }
+            core::task::Poll::Pending
         }
     }
 
-    trait AsyncMatcher: Fn() -> Self::OutputFuture {
+    pub trait AsyncMatcher: Fn() -> Self::OutputFuture {
         type OutputFuture: Future<Output = <Self as AsyncMatcher>::Output>;
         type Output;
     }
@@ -1568,7 +1585,7 @@ pub mod asyncify {
             info!("About to wait");
 
             self.waitable
-                .wait_while(move |_| async { !matcher().await })
+                .wait_while(|_| async { !matcher().await })
                 .await;
 
             info!("Waiting done - success");
@@ -1621,7 +1638,7 @@ pub mod asyncify {
         ) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
             self.wifi_driver.start_scan(config)?;
             self.waitable
-                .wait_while(|state| !matches!(state, ScanState::Done))
+                .wait_while(async move |state| !matches!(*state.lock(), ScanState::Done))
                 .await;
             self.wifi_driver.get_scan_result()
         }
