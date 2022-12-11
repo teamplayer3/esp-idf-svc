@@ -5,6 +5,7 @@
     feature(generic_associated_types)
 )]
 #![cfg_attr(feature = "nightly", feature(type_alias_impl_trait))]
+#![cfg_attr(feature = "nightly", feature(async_closure))] // for wifi::asyncify
 #![cfg_attr(not(version("1.66")), feature(const_btree_new))]
 
 #[cfg(any(feature = "alloc"))]
