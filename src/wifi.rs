@@ -607,40 +607,59 @@ impl<'d> WifiDriver<'d> {
         Ok(())
     }
 
-    #[allow(non_upper_case_globals)]
     pub fn scan_n<const N: usize>(
         &mut self,
+        scan_config: &ScanConfig,
     ) -> Result<(heapless::Vec<AccessPointInfo, N>, usize), EspError> {
-        let total_count = self.do_scan()?;
+        self.do_scan(scan_config)?;
+        self.get_scan_result_n()
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn scan(
+        &mut self,
+        scan_config: &ScanConfig,
+    ) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
+        self.do_scan(scan_config)?;
+        self.get_scan_result()
+    }
+
+    pub fn start_scan(&mut self, scan_config: &ScanConfig) -> Result<(), EspError> {
+        let scan_config: wifi_scan_config_t = scan_config.into();
+        esp!(unsafe { esp_wifi_scan_start(&scan_config as *const wifi_scan_config_t, false) })
+    }
+
+    pub fn stop_scan(&mut self) -> Result<(), EspError> {
+        esp!(unsafe { esp_wifi_scan_stop() })
+    }
+
+    pub fn get_scan_result_n<const N: usize>(
+        &mut self,
+    ) -> Result<(heapless::Vec<AccessPointInfo, N>, usize), EspError> {
+        let total_count = self.do_get_scan_amount()?;
 
         let mut ap_infos_raw: heapless::Vec<wifi_ap_record_t, N> = heapless::Vec::new();
+        unsafe {
+            ap_infos_raw.set_len(total_count.min(N));
+        }
 
         let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
 
-        unsafe {
-            ap_infos_raw.set_len(real_count);
-        }
+        let result = ap_infos_raw[..real_count]
+            .iter()
+            .map::<AccessPointInfo, _>(|ap_info_raw| Newtype(ap_info_raw).into())
+            .inspect(|ap_info| info!("Found access point {:?}", ap_info))
+            .collect();
 
-        let mut result = heapless::Vec::<_, N>::new();
-        for ap_info_raw in ap_infos_raw.iter().take(real_count) {
-            let ap_info: AccessPointInfo = Newtype(ap_info_raw).into();
-            info!("Found access point {:?}", ap_info);
-
-            if result.push(ap_info).is_err() {
-                break;
-            }
-        }
-
-        Ok((result, total_count))
+        Ok((result, real_count))
     }
 
-    #[allow(non_upper_case_globals)]
-    pub fn scan(&mut self) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
-        let total_count = self.do_scan()?;
+    #[cfg(feature = "alloc")]
+    pub fn get_scan_result(&mut self) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
+        let total_count = self.do_get_scan_amount()?;
 
         let mut ap_infos_raw: alloc::vec::Vec<wifi_ap_record_t> =
             alloc::vec::Vec::with_capacity(total_count);
-
         #[allow(clippy::uninit_vec)]
         // ... because we are filling it in on the next line and only reading the initialized members
         unsafe {
@@ -649,13 +668,11 @@ impl<'d> WifiDriver<'d> {
 
         let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
 
-        let mut result = alloc::vec::Vec::with_capacity(real_count);
-        for ap_info_raw in ap_infos_raw.iter().take(real_count) {
-            let ap_info: AccessPointInfo = Newtype(ap_info_raw).into();
-            info!("Found access point {:?}", ap_info);
-
-            result.push(ap_info);
-        }
+        let result = ap_infos_raw[..real_count]
+            .iter()
+            .map::<AccessPointInfo, _>(|ap_info_raw| Newtype(ap_info_raw).into())
+            .inspect(|ap_info| info!("Found access point {:?}", ap_info))
+            .collect();
 
         Ok(result)
     }
@@ -780,43 +797,7 @@ impl<'d> WifiDriver<'d> {
         Ok(())
     }
 
-    fn start_scan(&mut self, scan_config: &ScanConfig) -> Result<(), EspError> {
-        info!("About to scan for access points");
-
-        let scan_config: wifi_scan_config_t = scan_config.into();
-
-        esp!(unsafe { esp_wifi_scan_start(&scan_config as *const wifi_scan_config_t, false) })
-    }
-
-    fn stop_scan(&mut self) -> Result<(), EspError> {
-        esp!(unsafe { esp_wifi_scan_stop() })
-    }
-
-    fn get_scan_result(&mut self) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
-        let mut total_count: u16 = 0;
-        esp!(unsafe { esp_wifi_scan_get_ap_num(&mut total_count as *mut _) })?;
-
-        let mut ap_infos_raw: alloc::vec::Vec<wifi_ap_record_t> =
-            alloc::vec::Vec::with_capacity(total_count as usize);
-        #[allow(clippy::uninit_vec)]
-        // ... because we are filling it in on the next line and only reading the initialized members
-        unsafe {
-            ap_infos_raw.set_len(total_count as usize)
-        };
-
-        let real_count = self.do_get_scan_infos(&mut ap_infos_raw)?;
-
-        let mut result = alloc::vec::Vec::with_capacity(real_count);
-        for ap_info_raw in ap_infos_raw.iter().take(real_count) {
-            let ap_info: AccessPointInfo = Newtype(ap_info_raw).into();
-
-            result.push(ap_info);
-        }
-        Ok(result)
-    }
-
-    #[allow(non_upper_case_globals)]
-    fn do_scan(&mut self) -> Result<usize, EspError> {
+    fn do_scan(&mut self, scan_config: &ScanConfig) -> Result<(), EspError> {
         info!("About to scan for access points");
 
         let _ = self.disconnect();
@@ -825,10 +806,18 @@ impl<'d> WifiDriver<'d> {
         unsafe {
             esp!(esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_STA))?;
             esp!(esp_wifi_start())?;
-
-            esp!(esp_wifi_scan_start(ptr::null_mut(), true))?;
         }
 
+        let scan_config: wifi_scan_config_t = scan_config.into();
+        unsafe {
+            esp!(esp_wifi_scan_start(
+                &scan_config as *const wifi_scan_config_t,
+                true
+            ))
+        }
+    }
+
+    fn do_get_scan_amount(&mut self) -> Result<usize, EspError> {
         let mut found_ap: u16 = 0;
         esp!(unsafe { esp_wifi_scan_get_ap_num(&mut found_ap as *mut _) })?;
 
@@ -837,7 +826,6 @@ impl<'d> WifiDriver<'d> {
         Ok(found_ap as usize)
     }
 
-    #[allow(non_upper_case_globals)]
     fn do_get_scan_infos(
         &mut self,
         ap_infos_raw: &mut [wifi_ap_record_t],
@@ -949,11 +937,11 @@ impl<'d> Wifi for WifiDriver<'d> {
     fn scan_n<const N: usize>(
         &mut self,
     ) -> Result<(heapless::Vec<AccessPointInfo, N>, usize), Self::Error> {
-        WifiDriver::scan_n(self)
+        WifiDriver::scan_n(self, &ScanConfig::default())
     }
 
     fn scan(&mut self) -> Result<alloc::vec::Vec<AccessPointInfo>, Self::Error> {
-        WifiDriver::scan(self)
+        WifiDriver::scan(self, &ScanConfig::default())
     }
 }
 
@@ -1093,11 +1081,11 @@ impl<'d> EspWifi<'d> {
     pub fn scan_n<const N: usize>(
         &mut self,
     ) -> Result<(heapless::Vec<AccessPointInfo, N>, usize), EspError> {
-        self.driver_mut().scan_n()
+        self.driver_mut().scan_n(&ScanConfig::default())
     }
 
     pub fn scan(&mut self) -> Result<alloc::vec::Vec<AccessPointInfo>, EspError> {
-        self.driver_mut().scan()
+        self.driver_mut().scan(&ScanConfig::default())
     }
 
     fn attach_netif(&mut self) -> Result<(), EspError> {
